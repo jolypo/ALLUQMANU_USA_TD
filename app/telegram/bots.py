@@ -1,111 +1,2609 @@
 from __future__ import annotations
-import os,tempfile,uuid
-from telegram import Bot,Update
-from telegram.ext import Application,CommandHandler
+
+import os
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler
+
 from app.config import settings
-from app.telegram.messages import signal_text
 from app.reports.card import option_card
 from app.reports.performance import performance
+from app.telegram.messages import signal_text
 
 
 class TelegramHub:
-    def __init__(self,service,open_repo,history_repo,state_repo):
-        self.service=service; self.open_repo=open_repo; self.history_repo=history_repo; self.state_repo=state_repo
-        self.app=Application.builder().token(settings.signal_bot_token).updater(None).build()
-        self.profit=Bot(settings.profit_bot_token); self.report=Bot(settings.report_bot_token)
-        handlers={"start":self.start,"help":self.help,"myid":self.myid,"stock":self.stock,"option":self.option,"indexoption":self.indexoption,"open":self.open_trades,"status":self.status,"health":self.status,"risk":self.risk,"performance":self.performance,"report":self.report_cmd,"settings":self.settings_cmd,"pause":self.pause,"resume":self.resume,"market":self.market}
-        for cmd,fn in handlers.items(): self.app.add_handler(CommandHandler(cmd,fn))
+    """
+    Telegram control layer.
 
-    def allowed(self,u:Update)->bool: return bool(u.effective_user and u.effective_user.id==settings.telegram_admin_user_id)
-    async def _deny(self,u): await u.effective_message.reply_text("⛔ غير مصرح لهذا الحساب.")
-    def _paused(self)->bool:
-        rows=self.state_repo.all(); return bool(rows and rows[0].get("paused"))
-    def _set_paused(self,v:bool): self.state_repo.replace([{"paused":v}])
+    IMPORTANT:
+    - Admin commands are private-only.
+    - Scanning does NOT create Paper Trades.
+    - Scanning does NOT publish to the channel.
+    - Admin scans -> chooses /pick -> confirms /publish.
+    - Only /publish creates the Paper Trade.
+    """
 
-    def _portfolio_gate(self,d:dict)->tuple[bool,str]:
-        rows=[x for x in self.open_repo.all() if x.get("status")=="OPEN"]
-        if len(rows)>=settings.max_open_trades: return False,"تم بلوغ الحد الأقصى للصفقات المفتوحة"
-        total=sum(float(x.get("risk_pct",0) or 0) for x in rows)
-        if total+float(d.get("risk_pct",0) or 0)>settings.max_total_open_risk: return False,"إجمالي المخاطر المفتوحة سيتجاوز الحد المسموح"
-        if any(x.get("symbol")==d.get("symbol") for x in rows): return False,"يوجد بالفعل Trade مفتوح على الأصل نفسه"
-        sector=d.get("sector")
-        same=sum(1 for x in rows if sector not in {None,"N/A","INDEX"} and x.get("sector")==sector)
-        if same>=2: return False,f"التعرض الحالي لقطاع {sector} مرتفع"
-        return True,"ACCEPT"
+    def __init__(
+        self,
+        service,
+        open_repo,
+        history_repo,
+        state_repo,
+    ):
+        self.service = service
+        self.open_repo = open_repo
+        self.history_repo = history_repo
+        self.state_repo = state_repo
 
-    async def start(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        await u.effective_message.reply_text("✅ نظام ALLUQMANU_USA_TD جاهز.\n\n/stock /option /indexoption\n/open /performance /report /market /status /health /settings /risk /pause /resume /myid")
-    async def help(self,u,c): return await self.start(u,c)
-    async def myid(self,u,c): await u.effective_message.reply_text(f"👤 Telegram User ID:\n{u.effective_user.id}")
+        self.app = (
+            Application.builder()
+            .token(settings.signal_bot_token)
+            .updater(None)
+            .build()
+        )
 
-    async def _run(self,u,kind):
-        if not self.allowed(u): return await self._deny(u)
-        if self._paused(): return await u.effective_message.reply_text("⏸️ البحث عن إشارات جديدة موقوف. استخدم /resume.")
-        is_open,clock=await self.service.market_is_open()
-        if not is_open: return await u.effective_message.reply_text(f"⏰ السوق الأمريكي مغلق أو تعذر تأكيد أنه مفتوح.\nلن يتم استهلاك الفحص خارج الجلسة.\n{clock}")
-        await u.effective_message.reply_text("🔎 بدأ الفحص اليدوي... لا يتم إنشاء إشارات تلقائيًا.")
-        fn={"stock":self.service.best_stock,"option":self.service.best_equity_option,"index":self.service.best_index_option}[kind]
-        s,rejects=await fn()
-        if not s:
-            msg="❌ لا توجد صفقة READY حاليًا."
-            if rejects: msg += "\n\nأسباب مختصرة:\n"+"\n".join(f"• {x}" for x in rejects[-5:])
-            return await u.effective_message.reply_text(msg)
-        d=s.to_dict(); d["trade_id"]=("OPT" if d.get("option") else "STK")+"-"+uuid.uuid4().hex[:8].upper(); d["status"]="OPEN"; d.update({"tp1_hit":False,"tp2_hit":False,"tp3_hit":False,"near_stop_sent":False})
-        ok,reason=self._portfolio_gate(d)
-        if not ok: return await u.effective_message.reply_text(f"❌ تم رفض فتح Paper Trade بعد التحليل.\nالسبب: {reason}")
-        self.open_repo.append(d); text=signal_text(d)
-        if settings.telegram_channel_chat_id:
-            if d.get("option"):
-                path=os.path.join(tempfile.gettempdir(),f'{d["trade_id"]}.png'); option_card(d,path)
-                with open(path,"rb") as f: await self.app.bot.send_photo(settings.telegram_channel_chat_id,photo=f,caption=f'🚨 {d["symbol"]} | {d["option"]["type"]} | Strike {d["option"]["strike"]}\nالتفاصيل في الرسالة التالية.')
-                await self.app.bot.send_message(settings.telegram_channel_chat_id,text=text)
-                try: os.remove(path)
-                except OSError: pass
-            else: await self.app.bot.send_message(settings.telegram_channel_chat_id,text=text)
-            await u.effective_message.reply_text("✅ تم نشر الإشارة في القناة.")
+        self.profit = Bot(settings.profit_bot_token)
+        self.report = Bot(settings.report_bot_token)
+
+        # -----------------------------------------------------
+        # Pending scan selections
+        #
+        # user_id -> {
+        #     candidates: [...],
+        #     scan_type: stock / option / index,
+        #     created_monotonic: float,
+        #     picked_index: int | None,
+        #     published_indexes: set[int],
+        # }
+        # -----------------------------------------------------
+        self.pending_scans: dict[int, dict] = {}
+
+        # Pending manual closes
+        #
+        # user_id -> {
+        #     trade_id: "...",
+        #     created_monotonic: float,
+        # }
+        self.pending_closes: dict[int, dict] = {}
+
+        # Pending close-all confirmations
+        self.pending_close_all: dict[int, float] = {}
+
+        handlers = {
+            "start": self.start,
+            "help": self.help,
+            "myid": self.myid,
+
+            # Scan
+            "stock": self.stock,
+            "option": self.option,
+            "indexoption": self.indexoption,
+
+            # Manual approval
+            "pick": self.pick,
+            "publish": self.publish,
+            "cancel": self.cancel,
+
+            # Manual close
+            "close_stock": self.close_stock,
+            "close_option": self.close_option,
+            "close_index": self.close_index,
+            "close_trade": self.close_trade,
+            "confirm_close": self.confirm_close,
+            "close_all": self.close_all,
+            "confirm_close_all": self.confirm_close_all,
+
+            # Existing commands
+            "open": self.open_trades,
+            "status": self.status,
+            "health": self.status,
+            "risk": self.risk,
+            "performance": self.performance,
+            "report": self.report_cmd,
+            "settings": self.settings_cmd,
+            "pause": self.pause,
+            "resume": self.resume,
+            "market": self.market,
+        }
+
+        for command, handler in handlers.items():
+            self.app.add_handler(
+                CommandHandler(command, handler)
+            )
+
+    # =========================================================
+    # Authorization
+    # =========================================================
+
+    def allowed(self, update: Update) -> bool:
+        return bool(
+            update.effective_user
+            and update.effective_user.id
+            == settings.telegram_admin_user_id
+        )
+
+    async def _deny(self, update: Update):
+        await update.effective_message.reply_text(
+            "⛔ غير مصرح لهذا الحساب."
+        )
+
+    def _is_private(self, update: Update) -> bool:
+        return bool(
+            update.effective_chat
+            and update.effective_chat.type == "private"
+        )
+
+    async def _require_private(self, update: Update) -> bool:
+        if self._is_private(update):
+            return True
+
+        await update.effective_message.reply_text(
+            "🔒 هذا الأمر يعمل في المحادثة الخاصة "
+            "مع Signal Bot فقط."
+        )
+        return False
+
+    # =========================================================
+    # Pause State
+    # =========================================================
+
+    def _paused(self) -> bool:
+        rows = self.state_repo.all()
+
+        return bool(
+            rows
+            and rows[0].get("paused")
+        )
+
+    def _set_paused(self, value: bool):
+        self.state_repo.replace(
+            [{"paused": value}]
+        )
+
+    # =========================================================
+    # Common Helpers
+    # =========================================================
+
+    @staticmethod
+    def _requested_count(context) -> int:
+        """
+        /stock
+        /stock 2
+        /stock 3
+
+        Invalid values are safely clamped.
+        """
+
+        default = settings.default_signals_per_scan
+
+        if not context.args:
+            return default
+
+        try:
+            requested = int(context.args[0])
+        except (TypeError, ValueError):
+            return default
+
+        return max(
+            1,
+            min(
+                requested,
+                settings.max_signals_per_scan,
+            ),
+        )
+
+    @staticmethod
+    def _trade_type_ar(value: str) -> str:
+        mapping = {
+            "STOCK_INTRADAY":
+                "سهم أمريكي — مضاربة يومية",
+
+            "STOCK_SWING":
+                "سهم أمريكي — سوينغ",
+
+            "EQUITY_OPTION_INTRADAY":
+                "خيارات سهم — مضاربة يومية",
+
+            "EQUITY_OPTION_SWING":
+                "خيارات سهم — سوينغ",
+
+            "INDEX_OPTION_INTRADAY":
+                "خيارات مؤشر — مضاربة يومية",
+
+            "INDEX_OPTION_SWING":
+                "خيارات مؤشر — سوينغ",
+        }
+
+        return mapping.get(value, value)
+
+    @staticmethod
+    def _is_option_trade(trade: dict) -> bool:
+        return bool(trade.get("option"))
+
+    @staticmethod
+    def _is_index_trade(trade: dict) -> bool:
+        return str(
+            trade.get("trade_type", "")
+        ).startswith("INDEX_OPTION")
+
+    @staticmethod
+    def _trade_prefix(trade: dict) -> str:
+        if str(
+            trade.get("trade_type", "")
+        ).startswith("INDEX_OPTION"):
+            return "IDX"
+
+        if trade.get("option"):
+            return "OPT"
+
+        return "STK"
+
+    @staticmethod
+    def _contract_label(trade: dict) -> str:
+        option = trade.get("option") or {}
+
+        if not option:
+            return trade.get("symbol", "N/A")
+
+        contract_type = str(
+            option.get("type", "")
+        ).upper()
+
+        strike = option.get("strike", "")
+
+        return (
+            f'{trade.get("symbol", "N/A")} '
+            f'{strike} {contract_type}'
+        ).strip()
+
+    # =========================================================
+    # Candidate Expiry
+    # =========================================================
+
+    def _scan_expired(self, session: dict) -> bool:
+        age = (
+            time.monotonic()
+            - session["created_monotonic"]
+        )
+
+        return (
+            age
+            > settings.candidate_ttl_seconds
+        )
+
+    def _clear_expired_scan(
+        self,
+        user_id: int,
+    ) -> bool:
+        session = self.pending_scans.get(user_id)
+
+        if not session:
+            return False
+
+        if not self._scan_expired(session):
+            return False
+
+        self.pending_scans.pop(
+            user_id,
+            None,
+        )
+
+        return True
+
+    # =========================================================
+    # Portfolio / Duplicate / Daily Gates
+    # =========================================================
+
+    def _open_rows(self) -> list[dict]:
+        return [
+            row
+            for row in self.open_repo.all()
+            if row.get("status") == "OPEN"
+        ]
+
+    def _exact_duplicate(
+        self,
+        candidate: dict,
+        rows: list[dict],
+    ) -> bool:
+        """
+        Important:
+        NVDA Stock + NVDA Option is ALLOWED.
+
+        What is blocked:
+        - same stock trade idea
+        - exact same option contract
+        """
+
+        candidate_option = candidate.get("option")
+
+        for row in rows:
+            row_option = row.get("option")
+
+            # Stock vs stock
+            if not candidate_option and not row_option:
+                if (
+                    row.get("symbol")
+                    == candidate.get("symbol")
+                    and row.get("trade_type")
+                    == candidate.get("trade_type")
+                    and row.get("direction")
+                    == candidate.get("direction")
+                ):
+                    return True
+
+            # Option vs option
+            if candidate_option and row_option:
+                candidate_contract = str(
+                    candidate_option.get(
+                        "symbol",
+                        "",
+                    )
+                )
+
+                row_contract = str(
+                    row_option.get(
+                        "symbol",
+                        "",
+                    )
+                )
+
+                if (
+                    candidate_contract
+                    and row_contract
+                    and candidate_contract
+                    == row_contract
+                ):
+                    return True
+
+        return False
+
+    def _portfolio_gate(
+        self,
+        trade: dict,
+    ) -> tuple[bool, str]:
+        rows = self._open_rows()
+
+        # -----------------------------------------------
+        # Open trade count
+        # -----------------------------------------------
+        if len(rows) >= settings.max_open_trades:
+            return (
+                False,
+                "تم بلوغ الحد الأقصى "
+                "للصفقات المفتوحة.",
+            )
+
+        # -----------------------------------------------
+        # Total risk
+        # -----------------------------------------------
+        total_risk = sum(
+            float(
+                row.get(
+                    "risk_pct",
+                    0,
+                )
+                or 0
+            )
+            for row in rows
+        )
+
+        new_risk = float(
+            trade.get(
+                "risk_pct",
+                0,
+            )
+            or 0
+        )
+
+        if (
+            total_risk + new_risk
+            > settings.max_total_open_risk
+        ):
+            return (
+                False,
+                "إجمالي المخاطر المفتوحة "
+                "سيتجاوز الحد المسموح.",
+            )
+
+        # -----------------------------------------------
+        # Exact duplicate only
+        #
+        # Do NOT block NVDA stock merely because
+        # NVDA option is already open.
+        # -----------------------------------------------
+        if (
+            settings.prevent_exact_duplicate_trade
+            and self._exact_duplicate(
+                trade,
+                rows,
+            )
+        ):
+            return (
+                False,
+                "يوجد بالفعل Trade مطابق "
+                "أو عقد مطابق مفتوح.",
+            )
+
+        # -----------------------------------------------
+        # Sector concentration
+        #
+        # Do not hard reject simply because
+        # two same-sector trades exist.
+        # Risk ceiling remains the hard protection.
+        # -----------------------------------------------
+
+        return True, "ACCEPT"
+
+    def _daily_publish_count(
+        self,
+        category: str,
+    ) -> int:
+        """
+        Counts trades created/published today
+        from open + history.
+
+        category:
+        stock
+        option
+        index
+        """
+
+        today = datetime.now(
+            timezone.utc
+        ).date()
+
+        rows = (
+            self.open_repo.all()
+            + self.history_repo.all()
+        )
+
+        count = 0
+        seen_ids: set[str] = set()
+
+        for row in rows:
+            trade_id = str(
+                row.get(
+                    "trade_id",
+                    "",
+                )
+            )
+
+            if trade_id and trade_id in seen_ids:
+                continue
+
+            created_at = row.get("created_at")
+
+            if not created_at:
+                continue
+
+            try:
+                created_date = (
+                    datetime.fromisoformat(
+                        str(
+                            created_at
+                        ).replace(
+                            "Z",
+                            "+00:00",
+                        )
+                    )
+                    .astimezone(timezone.utc)
+                    .date()
+                )
+            except Exception:
+                continue
+
+            if created_date != today:
+                continue
+
+            trade_type = str(
+                row.get(
+                    "trade_type",
+                    "",
+                )
+            )
+
+            matches = False
+
+            if category == "stock":
+                matches = trade_type.startswith(
+                    "STOCK_"
+                )
+
+            elif category == "option":
+                matches = trade_type.startswith(
+                    "EQUITY_OPTION_"
+                )
+
+            elif category == "index":
+                matches = trade_type.startswith(
+                    "INDEX_OPTION_"
+                )
+
+            if matches:
+                count += 1
+
+                if trade_id:
+                    seen_ids.add(trade_id)
+
+        return count
+
+    def _daily_gate(
+        self,
+        trade: dict,
+    ) -> tuple[bool, str]:
+        trade_type = str(
+            trade.get(
+                "trade_type",
+                "",
+            )
+        )
+
+        if trade_type.startswith("STOCK_"):
+            current = self._daily_publish_count(
+                "stock"
+            )
+
+            limit = (
+                settings.max_daily_stock_signals
+            )
+
+            label = "صفقات الأسهم"
+
+        elif trade_type.startswith(
+            "EQUITY_OPTION_"
+        ):
+            current = self._daily_publish_count(
+                "option"
+            )
+
+            limit = (
+                settings
+                .max_daily_equity_option_signals
+            )
+
+            label = "عقود الأسهم"
+
         else:
-            await u.effective_message.reply_text(text+"\n\n⚠️ TELEGRAM_CHANNEL_CHAT_ID غير مضبوط؛ لذلك لم تُنشر في القناة.")
+            current = self._daily_publish_count(
+                "index"
+            )
 
-    async def stock(self,u,c): await self._run(u,"stock")
-    async def option(self,u,c): await self._run(u,"option")
-    async def indexoption(self,u,c): await self._run(u,"index")
+            limit = (
+                settings
+                .max_daily_index_option_signals
+            )
 
-    async def open_trades(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        rows=[x for x in self.open_repo.all() if x.get("status")=="OPEN"]
-        if not rows: return await u.effective_message.reply_text("📂 لا توجد صفقات مفتوحة.")
-        await u.effective_message.reply_text("📂 الصفقات المفتوحة\n\n"+"\n".join(f'• {x["symbol"]} | {x["trade_type"]} | Score {x["score"]} | {x.get("last_price","-")}' for x in rows))
+            label = "عقود المؤشر"
 
-    async def status(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        try: is_open,stamp=await self.service.market_is_open()
-        except Exception: is_open,stamp=False,"N/A"
-        await u.effective_message.reply_text(f"🤖 RUNNING ✅\nPaper: {settings.paper_mode}\nLive: {settings.live_trading}\nPaused: {self._paused()}\nUS Market open: {is_open}\nStocks: {len(settings.stocks)}\nIndex: {','.join(settings.indices)}\n0DTE: OFF\nChannel ID: {'SET' if settings.telegram_channel_chat_id else 'PENDING'}")
+        if current >= limit:
+            return (
+                False,
+                f"تم بلوغ الحد اليومي لـ{label}: "
+                f"{current}/{limit}",
+            )
 
-    async def risk(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        rows=[x for x in self.open_repo.all() if x.get("status")=="OPEN"]
-        total=sum(float(x.get("risk_pct",0) or 0) for x in rows)
-        await u.effective_message.reply_text(f"🛡️ المخاطر\nMax/trade: {settings.max_risk_per_trade*100:.2f}%\nMax total: {settings.max_total_open_risk*100:.2f}%\nOpen risk: {total*100:.2f}%\nMax open: {settings.max_open_trades}\nMIN R/R: 1:{settings.min_rr}\nرأس المال: غير محدد؛ لذلك لا يوجد Position Size بالدولار.")
+        return True, "ACCEPT"
 
-    async def performance(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        p=performance(self.history_repo.all())
-        await u.effective_message.reply_text(f'📊 الأداء الورقي\nالصفقات: {p["trades"]}\nالفوز: {p["wins"]}\nالخسارة: {p["losses"]}\nWin Rate: {p["win_rate"]}%\nProfit Factor: {p["profit_factor"]}\nNet P&L: {p["net_pnl_pct"]}%')
+    # =========================================================
+    # Start / Help
+    # =========================================================
 
-    async def report_cmd(self,u,c): return await self.performance(u,c)
-    async def settings_cmd(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        await u.effective_message.reply_text(f"⚙️ الإعدادات\nStock feed: {settings.alpaca_stock_feed}\nOptions feed: {settings.alpaca_options_feed}\nMin Score: {settings.min_score}\nMin R/R: {settings.min_rr}\nWatermark: {settings.watermark_name}\n0DTE: OFF")
-    async def pause(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        self._set_paused(True); await u.effective_message.reply_text("⏸️ تم إيقاف إنشاء الإشارات اليدوية. متابعة الصفقات تبقى فعالة.")
-    async def resume(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        self._set_paused(False); await u.effective_message.reply_text("▶️ تم استئناف البحث اليدوي عن الإشارات.")
-    async def market(self,u,c):
-        if not self.allowed(u): return await self._deny(u)
-        from app.market.regime import MarketRegimeEngine
-        reg=await MarketRegimeEngine(self.service.provider).get(); op,stamp=await self.service.market_is_open()
-        await u.effective_message.reply_text(f"🌎 Market Regime: {reg}\nUS Market Open: {op}\nالمرجع الأساسي: SPY / IEX")
+    async def start(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        await update.effective_message.reply_text(
+            "✅ نظام ALLUQMANU_USA_TD جاهز.\n\n"
+
+            "🔎 البحث:\n"
+            "/stock 1-3\n"
+            "/option 1-3\n"
+            "/indexoption 1-3\n\n"
+
+            "✅ الاعتماد والنشر:\n"
+            "/pick 1\n"
+            "/publish\n"
+            "/cancel\n\n"
+
+            "🔐 الإغلاق اليدوي:\n"
+            "/close_stock NVDA\n"
+            "/close_option NVDA\n"
+            "/close_index SPX\n"
+            "/close_trade TRADE_ID\n"
+            "/confirm_close TRADE_ID\n"
+            "/close_all\n"
+            "/confirm_close_all\n\n"
+
+            "📊 الإدارة:\n"
+            "/open\n"
+            "/performance\n"
+            "/report\n"
+            "/market\n"
+            "/status\n"
+            "/health\n"
+            "/settings\n"
+            "/risk\n"
+            "/pause\n"
+            "/resume\n"
+            "/myid"
+        )
+
+    async def help(
+        self,
+        update: Update,
+        context,
+    ):
+        return await self.start(
+            update,
+            context,
+        )
+
+    async def myid(
+        self,
+        update: Update,
+        context,
+    ):
+        if not update.effective_user:
+            return
+
+        await update.effective_message.reply_text(
+            "👤 Telegram User ID:\n"
+            f"{update.effective_user.id}"
+        )
+
+    # =========================================================
+    # Scanning
+    # =========================================================
+
+    async def _run_scan(
+        self,
+        update: Update,
+        context,
+        kind: str,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        if self._paused():
+            return await (
+                update.effective_message.reply_text(
+                    "⏸️ البحث عن إشارات جديدة موقوف.\n"
+                    "استخدم /resume."
+                )
+            )
+
+        is_open, clock = (
+            await self.service.market_is_open()
+        )
+
+        if not is_open:
+            return await (
+                update.effective_message.reply_text(
+                    "⏰ السوق الأمريكي مغلق "
+                    "أو تعذر تأكيد أنه مفتوح.\n\n"
+
+                    "لن يتم فتح أو نشر أي صفقة.\n"
+                    f"{clock}"
+                )
+            )
+
+        requested = self._requested_count(
+            context
+        )
+
+        labels = {
+            "stock": "الأسهم الأمريكية",
+            "option": "خيارات الأسهم",
+            "index": "خيارات SPX",
+        }
+
+        await update.effective_message.reply_text(
+            f"🔎 بدأ فحص {labels[kind]}\n\n"
+            f"المطلوب: أفضل {requested} "
+            "فرصة كحد أقصى\n\n"
+            "⚠️ لن يتم نشر أو فتح أي صفقة "
+            "قبل اختيارك وموافقتك."
+        )
+
+        if kind == "stock":
+            candidates, rejects = (
+                await self.service.best_stocks(
+                    requested
+                )
+            )
+
+        elif kind == "option":
+            candidates, rejects = (
+                await self.service
+                .best_equity_options(
+                    requested
+                )
+            )
+
+        else:
+            candidates, rejects = (
+                await self.service
+                .best_index_options(
+                    requested
+                )
+            )
+
+        if not candidates:
+            message = (
+                "❌ لا توجد صفقة READY حاليًا."
+            )
+
+            if rejects:
+                message += (
+                    "\n\nأسباب مختصرة:\n"
+                    + "\n".join(
+                        f"• {item}"
+                        for item in rejects[-7:]
+                    )
+                )
+
+            return await (
+                update.effective_message.reply_text(
+                    message
+                )
+            )
+
+        rows: list[dict] = [
+            signal.to_dict()
+            for signal in candidates
+        ]
+
+        user_id = update.effective_user.id
+
+        self.pending_scans[user_id] = {
+            "candidates": rows,
+            "scan_type": kind,
+            "created_monotonic":
+                time.monotonic(),
+            "picked_index": None,
+            "published_indexes": set(),
+        }
+
+        lines = [
+            "✅ اكتمل الفحص",
+            "",
+            f"تم العثور على {len(rows)} "
+            "فرصة READY:",
+            "",
+        ]
+
+        medals = {
+            1: "🥇",
+            2: "🥈",
+            3: "🥉",
+        }
+
+        for index, trade in enumerate(
+            rows,
+            start=1,
+        ):
+            medal = medals.get(
+                index,
+                "🔹",
+            )
+
+            lines.append(
+                f"{medal} {index}) "
+                f"{self._contract_label(trade)}"
+            )
+
+            lines.append(
+                "النوع: "
+                f"{self._trade_type_ar(trade['trade_type'])}"
+            )
+
+            lines.append(
+                f"Score: {trade['score']}/100"
+            )
+
+            lines.append(
+                f"R/R: 1 : {trade['rr']}"
+            )
+
+            if trade.get("option"):
+                option = trade["option"]
+
+                lines.append(
+                    "Expiration: "
+                    f"{option.get('expiration', 'N/A')}"
+                )
+
+                lines.append(
+                    "DTE: "
+                    f"{option.get('dte', 'N/A')}"
+                )
+
+                lines.append(
+                    "Bid/Ask: "
+                    f"${option.get('bid', 'N/A')} / "
+                    f"${option.get('ask', 'N/A')}"
+                )
+
+            lines.append("")
+
+        lines.extend(
+            [
+                "اختر الصفقة برقم:",
+                "",
+            ]
+        )
+
+        for index in range(
+            1,
+            len(rows) + 1,
+        ):
+            lines.append(
+                f"/pick {index}"
+            )
+
+        lines.extend(
+            [
+                "",
+                "⏳ صلاحية نتائج الفحص: "
+                f"{settings.candidate_ttl_seconds // 60} "
+                "دقائق.",
+                "",
+                "⚠️ لا شيء تم نشره حتى الآن.",
+            ]
+        )
+
+        await update.effective_message.reply_text(
+            "\n".join(lines)
+        )
+
+    async def stock(
+        self,
+        update: Update,
+        context,
+    ):
+        await self._run_scan(
+            update,
+            context,
+            "stock",
+        )
+
+    async def option(
+        self,
+        update: Update,
+        context,
+    ):
+        await self._run_scan(
+            update,
+            context,
+            "option",
+        )
+
+    async def indexoption(
+        self,
+        update: Update,
+        context,
+    ):
+        await self._run_scan(
+            update,
+            context,
+            "index",
+        )
+
+    # =========================================================
+    # Pick
+    # =========================================================
+
+    async def pick(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        user_id = update.effective_user.id
+
+        if self._clear_expired_scan(user_id):
+            return await (
+                update.effective_message.reply_text(
+                    "⚠️ انتهت صلاحية نتائج الفحص.\n"
+                    "أعد البحث للحصول على أسعار "
+                    "وبيانات محدثة."
+                )
+            )
+
+        session = self.pending_scans.get(
+            user_id
+        )
+
+        if not session:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ لا يوجد فحص نشط.\n\n"
+                    "استخدم أولًا:\n"
+                    "/stock 3\n"
+                    "أو /option 3\n"
+                    "أو /indexoption 3"
+                )
+            )
+
+        if not context.args:
+            return await (
+                update.effective_message.reply_text(
+                    "استخدم مثلًا:\n"
+                    "/pick 1"
+                )
+            )
+
+        try:
+            selected_number = int(
+                context.args[0]
+            )
+        except ValueError:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ رقم غير صحيح.\n"
+                    "مثال: /pick 2"
+                )
+            )
+
+        candidates = session["candidates"]
+
+        if not (
+            1
+            <= selected_number
+            <= len(candidates)
+        ):
+            return await (
+                update.effective_message.reply_text(
+                    "❌ رقم الصفقة غير موجود.\n"
+                    f"اختر من 1 إلى "
+                    f"{len(candidates)}."
+                )
+            )
+
+        index = selected_number - 1
+
+        if index in session[
+            "published_indexes"
+        ]:
+            return await (
+                update.effective_message.reply_text(
+                    "⚠️ هذه الصفقة سبق نشرها "
+                    "من نفس الفحص."
+                )
+            )
+
+        session["picked_index"] = index
+
+        trade = candidates[index]
+
+        lines = [
+            "✅ تم اختيار الصفقة",
+            "",
+            f"رقم الاختيار: {selected_number}",
+            "",
+            f"الأصل: {self._contract_label(trade)}",
+            "النوع: "
+            f"{self._trade_type_ar(trade['trade_type'])}",
+            f"Score: {trade['score']}/100",
+            f"R/R: 1 : {trade['rr']}",
+            "",
+            f"الدخول: "
+            f"{trade['entry_low']} – "
+            f"{trade['entry_high']}",
+            f"وقف الخسارة: {trade['stop']}",
+            f"TP1: {trade['tp1']}",
+            f"TP2: {trade['tp2']}",
+            f"TP3: {trade['tp3']}",
+            "",
+            "⚠️ لم يتم فتح أو نشر الصفقة بعد.",
+            "",
+            "للاعتماد والنشر:",
+            "/publish",
+            "",
+            "للإلغاء:",
+            "/cancel",
+        ]
+
+        await update.effective_message.reply_text(
+            "\n".join(lines)
+        )
+
+    # =========================================================
+    # Publish
+    # =========================================================
+
+    async def publish(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        user_id = update.effective_user.id
+
+        if self._clear_expired_scan(user_id):
+            return await (
+                update.effective_message.reply_text(
+                    "⚠️ انتهت صلاحية الصفقة المختارة.\n\n"
+                    "لم يتم إنشاء Paper Trade "
+                    "ولم يتم النشر.\n\n"
+                    "أعد الفحص للحصول على "
+                    "بيانات محدثة."
+                )
+            )
+
+        session = self.pending_scans.get(
+            user_id
+        )
+
+        if not session:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ لا توجد صفقة بانتظار النشر."
+                )
+            )
+
+        picked_index = session.get(
+            "picked_index"
+        )
+
+        if picked_index is None:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ اختر الصفقة أولًا.\n\n"
+                    "مثال:\n"
+                    "/pick 1"
+                )
+            )
+
+        if picked_index in session[
+            "published_indexes"
+        ]:
+            return await (
+                update.effective_message.reply_text(
+                    "⚠️ هذه الصفقة سبق نشرها."
+                )
+            )
+
+        trade = dict(
+            session["candidates"][
+                picked_index
+            ]
+        )
+
+        # -----------------------------------------------
+        # Re-check portfolio at PUBLISH time.
+        # Not at scan time.
+        # -----------------------------------------------
+        ok, reason = self._portfolio_gate(
+            trade
+        )
+
+        if not ok:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ لم يتم اعتماد الصفقة.\n\n"
+                    f"السبب:\n{reason}\n\n"
+                    "لم يتم فتح أو نشر شيء."
+                )
+            )
+
+        daily_ok, daily_reason = (
+            self._daily_gate(trade)
+        )
+
+        if not daily_ok:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ لم يتم اعتماد الصفقة.\n\n"
+                    f"{daily_reason}\n\n"
+                    "لم يتم فتح أو نشر شيء."
+                )
+            )
+
+        if not settings.telegram_channel_chat_id:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ TELEGRAM_CHANNEL_CHAT_ID "
+                    "غير مضبوط.\n\n"
+                    "لم يتم إنشاء Paper Trade "
+                    "لأن النشر في القناة فشل "
+                    "قبل أن يبدأ."
+                )
+            )
+
+        # -----------------------------------------------
+        # Assign Trade ID only after admin approval.
+        # -----------------------------------------------
+        prefix = self._trade_prefix(trade)
+
+        trade["trade_id"] = (
+            f"{prefix}-"
+            f"{uuid.uuid4().hex[:8].upper()}"
+        )
+
+        trade["status"] = "OPEN"
+
+        trade["published_at"] = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+        trade.update(
+            {
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "tp3_hit": False,
+                "near_stop_sent": False,
+                "manual_publish": True,
+            }
+        )
+
+        text = signal_text(trade)
+
+        image_path = None
+
+        try:
+            # -------------------------------------------
+            # OPTION IMAGE
+            #
+            # Horizontal card for BOTH:
+            # - Equity Options
+            # - SPX Index Options
+            # -------------------------------------------
+            if trade.get("option"):
+                image_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f'{trade["trade_id"]}.png',
+                )
+
+                option_card(
+                    trade,
+                    image_path,
+                )
+
+                with open(
+                    image_path,
+                    "rb",
+                ) as photo_file:
+                    await self.app.bot.send_photo(
+                        chat_id=(
+                            settings
+                            .telegram_channel_chat_id
+                        ),
+                        photo=photo_file,
+                    )
+
+            # Old detailed message remains unchanged.
+            await self.app.bot.send_message(
+                chat_id=(
+                    settings.telegram_channel_chat_id
+                ),
+                text=text,
+            )
+
+        except Exception as exc:
+            # Critical:
+            # Do NOT create open trade if Telegram
+            # publishing fails.
+            return await (
+                update.effective_message.reply_text(
+                    "❌ فشل نشر الصفقة في القناة.\n\n"
+                    "لم يتم إنشاء Paper Trade.\n\n"
+                    f"الخطأ: "
+                    f"{type(exc).__name__}"
+                )
+            )
+
+        finally:
+            if image_path:
+                try:
+                    os.remove(image_path)
+                except OSError:
+                    pass
+
+        # -----------------------------------------------
+        # Only NOW persist as OPEN.
+        # -----------------------------------------------
+        self.open_repo.append(trade)
+
+        session[
+            "published_indexes"
+        ].add(picked_index)
+
+        session["picked_index"] = None
+
+        await update.effective_message.reply_text(
+            "✅ تم اعتماد ونشر الصفقة بنجاح.\n\n"
+            f"🆔 Trade ID:\n"
+            f"{trade['trade_id']}\n\n"
+            "📡 تم نشرها في القناة.\n"
+            "📂 أصبحت الآن ضمن الصفقات المفتوحة."
+        )
+
+    # =========================================================
+    # Cancel Selection
+    # =========================================================
+
+    async def cancel(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        user_id = update.effective_user.id
+
+        session = self.pending_scans.get(
+            user_id
+        )
+
+        if not session:
+            return await (
+                update.effective_message.reply_text(
+                    "ℹ️ لا يوجد اختيار نشط لإلغائه."
+                )
+            )
+
+        session["picked_index"] = None
+
+        await update.effective_message.reply_text(
+            "✅ تم إلغاء الاختيار.\n"
+            "لم يتم فتح أو نشر أي صفقة.\n\n"
+            "تستطيع اختيار فرصة أخرى من "
+            "نفس نتائج الفحص قبل انتهاء صلاحيتها."
+        )
+
+    # =========================================================
+    # Latest Price Helpers
+    # =========================================================
+
+    async def _latest_trade_price(
+        self,
+        trade: dict,
+    ) -> float | None:
+        """
+        Used for manual Paper close.
+
+        Stock:
+        latest IEX bar close.
+
+        Options:
+        indicative latest quote midpoint.
+        """
+
+        option = trade.get("option")
+
+        try:
+            if option:
+                contract_symbol = option.get(
+                    "symbol"
+                )
+
+                if not contract_symbol:
+                    return trade.get(
+                        "last_price"
+                    )
+
+                quotes = (
+                    await self.service.provider
+                    .option_quotes(
+                        [contract_symbol]
+                    )
+                )
+
+                quote = quotes.get(
+                    contract_symbol,
+                    {},
+                )
+
+                bid = quote.get("bp")
+                ask = quote.get("ap")
+
+                if (
+                    bid is not None
+                    and ask is not None
+                ):
+                    bid = float(bid)
+                    ask = float(ask)
+
+                    if bid > 0 and ask > 0:
+                        return round(
+                            (
+                                bid + ask
+                            )
+                            / 2,
+                            4,
+                        )
+
+                if bid is not None:
+                    return float(bid)
+
+                if ask is not None:
+                    return float(ask)
+
+            else:
+                symbol = trade.get("symbol")
+
+                bars = (
+                    await self.service.provider
+                    .latest_bars(
+                        [symbol]
+                    )
+                )
+
+                bar = bars.get(
+                    symbol,
+                    {},
+                )
+
+                close = bar.get("c")
+
+                if close is not None:
+                    return float(close)
+
+        except Exception:
+            pass
+
+        fallback = trade.get(
+            "last_price"
+        )
+
+        if fallback is None:
+            return None
+
+        try:
+            return float(fallback)
+        except Exception:
+            return None
+
+    # =========================================================
+    # Manual Close Helpers
+    # =========================================================
+
+    def _find_open_trade(
+        self,
+        trade_id: str,
+    ) -> dict | None:
+        trade_id = trade_id.upper()
+
+        for trade in self._open_rows():
+            if str(
+                trade.get(
+                    "trade_id",
+                    "",
+                )
+            ).upper() == trade_id:
+                return trade
+
+        return None
+
+    async def _prepare_close(
+        self,
+        update: Update,
+        trade: dict,
+    ):
+        user_id = update.effective_user.id
+
+        trade_id = trade["trade_id"]
+
+        last_price = (
+            await self._latest_trade_price(
+                trade
+            )
+        )
+
+        self.pending_closes[user_id] = {
+            "trade_id": trade_id,
+            "created_monotonic":
+                time.monotonic(),
+        }
+
+        entry = float(
+            trade.get(
+                "entry_high",
+                trade.get(
+                    "entry_low",
+                    0,
+                ),
+            )
+            or 0
+        )
+
+        pnl_text = "N/A"
+
+        if (
+            last_price is not None
+            and entry > 0
+        ):
+            pnl = (
+                (
+                    last_price
+                    - entry
+                )
+                / entry
+            ) * 100
+
+            pnl_text = f"{pnl:+.2f}%"
+
+        await update.effective_message.reply_text(
+            "🔎 تم العثور على الصفقة\n\n"
+
+            f"الأصل:\n"
+            f"{self._contract_label(trade)}\n\n"
+
+            f"النوع:\n"
+            f"{self._trade_type_ar(trade['trade_type'])}\n\n"
+
+            f"Trade ID:\n"
+            f"{trade_id}\n\n"
+
+            f"سعر الدخول المرجعي:\n"
+            f"{entry}\n\n"
+
+            f"آخر سعر متاح:\n"
+            f"{last_price if last_price is not None else 'N/A'}\n\n"
+
+            f"P&L التقريبي:\n"
+            f"{pnl_text}\n\n"
+
+            "⚠️ هل تريد إغلاقها ورقيًا؟\n\n"
+
+            "للتأكيد:\n"
+            f"/confirm_close {trade_id}"
+        )
+
+    # =========================================================
+    # Close Stock
+    # =========================================================
+
+    async def close_stock(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        if not context.args:
+            return await (
+                update.effective_message.reply_text(
+                    "استخدم:\n"
+                    "/close_stock NVDA"
+                )
+            )
+
+        symbol = context.args[0].upper()
+
+        rows = [
+            trade
+            for trade in self._open_rows()
+            if (
+                trade.get("symbol") == symbol
+                and str(
+                    trade.get(
+                        "trade_type",
+                        "",
+                    )
+                ).startswith("STOCK_")
+            )
+        ]
+
+        if not rows:
+            return await (
+                update.effective_message.reply_text(
+                    f"📂 لا توجد صفقة سهم "
+                    f"مفتوحة على {symbol}."
+                )
+            )
+
+        if len(rows) > 1:
+            lines = [
+                f"⚠️ توجد {len(rows)} "
+                f"صفقات سهم مفتوحة على {symbol}.",
+                "",
+                "اختر Trade ID:",
+                "",
+            ]
+
+            for trade in rows:
+                lines.append(
+                    f"/close_trade "
+                    f"{trade['trade_id']}"
+                )
+
+            return await (
+                update.effective_message.reply_text(
+                    "\n".join(lines)
+                )
+            )
+
+        await self._prepare_close(
+            update,
+            rows[0],
+        )
+
+    # =========================================================
+    # Close Equity Option
+    # =========================================================
+
+    async def close_option(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        if not context.args:
+            return await (
+                update.effective_message.reply_text(
+                    "استخدم:\n"
+                    "/close_option NVDA"
+                )
+            )
+
+        symbol = context.args[0].upper()
+
+        rows = [
+            trade
+            for trade in self._open_rows()
+            if (
+                trade.get("symbol") == symbol
+                and str(
+                    trade.get(
+                        "trade_type",
+                        "",
+                    )
+                ).startswith(
+                    "EQUITY_OPTION_"
+                )
+            )
+        ]
+
+        if not rows:
+            return await (
+                update.effective_message.reply_text(
+                    f"📂 لا توجد عقود أسهم "
+                    f"مفتوحة على {symbol}."
+                )
+            )
+
+        if len(rows) > 1:
+            lines = [
+                f"📄 يوجد {len(rows)} "
+                f"عقد مفتوح على {symbol}:",
+                "",
+            ]
+
+            for trade in rows:
+                lines.extend(
+                    [
+                        self._contract_label(
+                            trade
+                        ),
+                        f"Trade ID: "
+                        f"{trade['trade_id']}",
+                        "",
+                    ]
+                )
+
+            lines.append(
+                "اختر العقد باستخدام:"
+            )
+
+            for trade in rows:
+                lines.append(
+                    f"/close_trade "
+                    f"{trade['trade_id']}"
+                )
+
+            return await (
+                update.effective_message.reply_text(
+                    "\n".join(lines)
+                )
+            )
+
+        await self._prepare_close(
+            update,
+            rows[0],
+        )
+
+    # =========================================================
+    # Close Index Option
+    # =========================================================
+
+    async def close_index(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        symbol = (
+            context.args[0].upper()
+            if context.args
+            else "SPX"
+        )
+
+        rows = [
+            trade
+            for trade in self._open_rows()
+            if (
+                trade.get("symbol") == symbol
+                and str(
+                    trade.get(
+                        "trade_type",
+                        "",
+                    )
+                ).startswith(
+                    "INDEX_OPTION_"
+                )
+            )
+        ]
+
+        if not rows:
+            return await (
+                update.effective_message.reply_text(
+                    f"📂 لا توجد عقود مؤشر "
+                    f"مفتوحة على {symbol}."
+                )
+            )
+
+        if len(rows) > 1:
+            lines = [
+                f"📊 يوجد {len(rows)} "
+                f"عقد مؤشر مفتوح على {symbol}:",
+                "",
+            ]
+
+            for trade in rows:
+                lines.extend(
+                    [
+                        self._contract_label(
+                            trade
+                        ),
+                        f"Trade ID: "
+                        f"{trade['trade_id']}",
+                        "",
+                    ]
+                )
+
+            lines.append(
+                "اختر باستخدام:"
+            )
+
+            for trade in rows:
+                lines.append(
+                    f"/close_trade "
+                    f"{trade['trade_id']}"
+                )
+
+            return await (
+                update.effective_message.reply_text(
+                    "\n".join(lines)
+                )
+            )
+
+        await self._prepare_close(
+            update,
+            rows[0],
+        )
+
+    # =========================================================
+    # Close by Trade ID
+    # =========================================================
+
+    async def close_trade(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        if not context.args:
+            return await (
+                update.effective_message.reply_text(
+                    "استخدم:\n"
+                    "/close_trade OPT-XXXXXXXX"
+                )
+            )
+
+        trade_id = context.args[0].upper()
+
+        trade = self._find_open_trade(
+            trade_id
+        )
+
+        if not trade:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ لم يتم العثور على "
+                    "Trade مفتوح بهذا ID."
+                )
+            )
+
+        await self._prepare_close(
+            update,
+            trade,
+        )
+
+    # =========================================================
+    # Confirm Close
+    # =========================================================
+
+    async def confirm_close(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        if not context.args:
+            return await (
+                update.effective_message.reply_text(
+                    "استخدم:\n"
+                    "/confirm_close TRADE_ID"
+                )
+            )
+
+        user_id = update.effective_user.id
+        trade_id = context.args[0].upper()
+
+        pending = self.pending_closes.get(
+            user_id
+        )
+
+        if not pending:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ لا يوجد طلب إغلاق "
+                    "بانتظار التأكيد."
+                )
+            )
+
+        age = (
+            time.monotonic()
+            - pending["created_monotonic"]
+        )
+
+        if age > 300:
+            self.pending_closes.pop(
+                user_id,
+                None,
+            )
+
+            return await (
+                update.effective_message.reply_text(
+                    "⚠️ انتهت صلاحية تأكيد الإغلاق.\n"
+                    "أعد طلب الإغلاق."
+                )
+            )
+
+        if (
+            pending["trade_id"].upper()
+            != trade_id
+        ):
+            return await (
+                update.effective_message.reply_text(
+                    "❌ Trade ID لا يطابق "
+                    "الصفقة المنتظرة للتأكيد."
+                )
+            )
+
+        trade = self._find_open_trade(
+            trade_id
+        )
+
+        if not trade:
+            self.pending_closes.pop(
+                user_id,
+                None,
+            )
+
+            return await (
+                update.effective_message.reply_text(
+                    "ℹ️ الصفقة لم تعد مفتوحة."
+                )
+            )
+
+        exit_price = (
+            await self._latest_trade_price(
+                trade
+            )
+        )
+
+        if exit_price is None:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ تعذر الحصول على سعر "
+                    "حالي موثوق للإغلاق الورقي.\n\n"
+                    "لم يتم إغلاق الصفقة."
+                )
+            )
+
+        entry = float(
+            trade.get(
+                "entry_high",
+                trade.get(
+                    "entry_low",
+                    0,
+                ),
+            )
+            or 0
+        )
+
+        pnl_pct = 0.0
+
+        if entry > 0:
+            pnl_pct = (
+                (
+                    exit_price - entry
+                )
+                / entry
+            ) * 100
+
+        closed_trade = dict(trade)
+
+        closed_trade.update(
+            {
+                "status": "CLOSED",
+                "exit_price": exit_price,
+                "last_price": exit_price,
+                "pnl_pct": round(
+                    pnl_pct,
+                    4,
+                ),
+                "exit_reason":
+                    "MANUAL_CLOSE",
+                "closed_at":
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+            }
+        )
+
+        # Remove from open repository.
+        open_rows = [
+            row
+            for row in self.open_repo.all()
+            if row.get("trade_id") != trade_id
+        ]
+
+        self.open_repo.replace(
+            open_rows
+        )
+
+        # Add to permanent history.
+        self.history_repo.append(
+            closed_trade
+        )
+
+        self.pending_closes.pop(
+            user_id,
+            None,
+        )
+
+        result_icon = (
+            "🟢"
+            if pnl_pct >= 0
+            else "🔴"
+        )
+
+        private_message = (
+            f"{result_icon} تم الإغلاق الورقي بنجاح\n\n"
+
+            f"الأصل:\n"
+            f"{self._contract_label(closed_trade)}\n\n"
+
+            f"Trade ID:\n"
+            f"{trade_id}\n\n"
+
+            f"الدخول:\n"
+            f"{entry}\n\n"
+
+            f"الخروج:\n"
+            f"{exit_price}\n\n"
+
+            f"النتيجة:\n"
+            f"{pnl_pct:+.2f}%\n\n"
+
+            "Exit Reason:\n"
+            "MANUAL_CLOSE"
+        )
+
+        await update.effective_message.reply_text(
+            private_message
+        )
+
+        # Publish close result to channel because
+        # the original trade was published there.
+        if settings.telegram_channel_chat_id:
+            try:
+                await self.app.bot.send_message(
+                    chat_id=(
+                        settings
+                        .telegram_channel_chat_id
+                    ),
+                    text=(
+                        "🟠 تم إغلاق الصفقة يدويًا\n\n"
+
+                        f"{self._contract_label(closed_trade)}\n\n"
+
+                        f"🆔 {trade_id}\n\n"
+
+                        f"الدخول:\n{entry}\n\n"
+
+                        f"الخروج:\n{exit_price}\n\n"
+
+                        f"📊 النتيجة:\n"
+                        f"{pnl_pct:+.2f}%\n\n"
+
+                        "Exit Reason:\n"
+                        "MANUAL_CLOSE\n\n"
+
+                        "⚠️ Paper Trading"
+                    ),
+                )
+            except Exception:
+                # Closing the Paper Trade itself remains valid
+                # even if channel notification temporarily fails.
+                await (
+                    update.effective_message.reply_text(
+                        "⚠️ تم إغلاق الصفقة وتسجيلها، "
+                        "لكن تعذر إرسال إشعار الإغلاق "
+                        "إلى القناة."
+                    )
+                )
+
+    # =========================================================
+    # Close All
+    # =========================================================
+
+    async def close_all(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        rows = self._open_rows()
+
+        if not rows:
+            return await (
+                update.effective_message.reply_text(
+                    "📂 لا توجد صفقات مفتوحة."
+                )
+            )
+
+        user_id = update.effective_user.id
+
+        self.pending_close_all[
+            user_id
+        ] = time.monotonic()
+
+        stock_count = sum(
+            1
+            for trade in rows
+            if str(
+                trade.get(
+                    "trade_type",
+                    "",
+                )
+            ).startswith("STOCK_")
+        )
+
+        option_count = sum(
+            1
+            for trade in rows
+            if str(
+                trade.get(
+                    "trade_type",
+                    "",
+                )
+            ).startswith(
+                "EQUITY_OPTION_"
+            )
+        )
+
+        index_count = sum(
+            1
+            for trade in rows
+            if str(
+                trade.get(
+                    "trade_type",
+                    "",
+                )
+            ).startswith(
+                "INDEX_OPTION_"
+            )
+        )
+
+        await update.effective_message.reply_text(
+            "⚠️ طلب إغلاق جميع الصفقات\n\n"
+
+            f"إجمالي الصفقات المفتوحة:\n"
+            f"{len(rows)}\n\n"
+
+            f"Stocks: {stock_count}\n"
+            f"Equity Options: {option_count}\n"
+            f"Index Options: {index_count}\n\n"
+
+            "لن يتم الإغلاق حتى تؤكد.\n\n"
+
+            "للتأكيد:\n"
+            "/confirm_close_all"
+        )
+
+    async def confirm_close_all(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        user_id = update.effective_user.id
+
+        started = self.pending_close_all.get(
+            user_id
+        )
+
+        if started is None:
+            return await (
+                update.effective_message.reply_text(
+                    "❌ لا يوجد طلب Close All "
+                    "بانتظار التأكيد."
+                )
+            )
+
+        if (
+            time.monotonic() - started
+            > 300
+        ):
+            self.pending_close_all.pop(
+                user_id,
+                None,
+            )
+
+            return await (
+                update.effective_message.reply_text(
+                    "⚠️ انتهت صلاحية التأكيد.\n"
+                    "استخدم /close_all من جديد."
+                )
+            )
+
+        rows = self._open_rows()
+
+        if not rows:
+            self.pending_close_all.pop(
+                user_id,
+                None,
+            )
+
+            return await (
+                update.effective_message.reply_text(
+                    "📂 لا توجد صفقات مفتوحة."
+                )
+            )
+
+        closed = []
+        failed = []
+
+        for trade in rows:
+            try:
+                exit_price = (
+                    await self._latest_trade_price(
+                        trade
+                    )
+                )
+
+                if exit_price is None:
+                    failed.append(
+                        trade["trade_id"]
+                    )
+                    continue
+
+                entry = float(
+                    trade.get(
+                        "entry_high",
+                        trade.get(
+                            "entry_low",
+                            0,
+                        ),
+                    )
+                    or 0
+                )
+
+                pnl_pct = 0.0
+
+                if entry > 0:
+                    pnl_pct = (
+                        (
+                            exit_price - entry
+                        )
+                        / entry
+                    ) * 100
+
+                result = dict(trade)
+
+                result.update(
+                    {
+                        "status": "CLOSED",
+                        "exit_price":
+                            exit_price,
+                        "last_price":
+                            exit_price,
+                        "pnl_pct":
+                            round(
+                                pnl_pct,
+                                4,
+                            ),
+                        "exit_reason":
+                            "MANUAL_CLOSE_ALL",
+                        "closed_at":
+                            datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                    }
+                )
+
+                self.history_repo.append(
+                    result
+                )
+
+                closed.append(result)
+
+            except Exception:
+                failed.append(
+                    trade.get(
+                        "trade_id",
+                        "UNKNOWN",
+                    )
+                )
+
+        closed_ids = {
+            trade["trade_id"]
+            for trade in closed
+        }
+
+        remaining = [
+            trade
+            for trade in self.open_repo.all()
+            if trade.get("trade_id")
+            not in closed_ids
+        ]
+
+        self.open_repo.replace(
+            remaining
+        )
+
+        self.pending_close_all.pop(
+            user_id,
+            None,
+        )
+
+        message = (
+            "✅ انتهى طلب Close All\n\n"
+
+            f"تم إغلاق:\n"
+            f"{len(closed)} صفقة\n\n"
+
+            f"تعذر إغلاق:\n"
+            f"{len(failed)} صفقة\n\n"
+
+            "Exit Reason:\n"
+            "MANUAL_CLOSE_ALL"
+        )
+
+        if failed:
+            message += (
+                "\n\n⚠️ الصفقات التي بقيت مفتوحة:\n"
+                + "\n".join(
+                    f"• {trade_id}"
+                    for trade_id in failed
+                )
+            )
+
+        await update.effective_message.reply_text(
+            message
+        )
+
+        if (
+            closed
+            and settings.telegram_channel_chat_id
+        ):
+            try:
+                await self.app.bot.send_message(
+                    chat_id=(
+                        settings
+                        .telegram_channel_chat_id
+                    ),
+                    text=(
+                        "🟠 إغلاق يدوي جماعي "
+                        "للصفقات الورقية\n\n"
+
+                        f"عدد الصفقات المغلقة: "
+                        f"{len(closed)}\n\n"
+
+                        "Exit Reason:\n"
+                        "MANUAL_CLOSE_ALL\n\n"
+
+                        "⚠️ Paper Trading"
+                    ),
+                )
+            except Exception:
+                pass
+
+    # =========================================================
+    # Open Trades
+    # =========================================================
+
+    async def open_trades(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        rows = self._open_rows()
+
+        if not rows:
+            return await (
+                update.effective_message.reply_text(
+                    "📂 لا توجد صفقات مفتوحة."
+                )
+            )
+
+        lines = [
+            "📂 الصفقات المفتوحة",
+            "",
+            f"العدد: {len(rows)} / "
+            f"{settings.max_open_trades}",
+            "",
+        ]
+
+        for index, trade in enumerate(
+            rows,
+            start=1,
+        ):
+            lines.extend(
+                [
+                    f"{index}) "
+                    f"{self._contract_label(trade)}",
+                    f"🆔 "
+                    f"{trade.get('trade_id', 'N/A')}",
+                    "النوع: "
+                    f"{self._trade_type_ar(trade.get('trade_type', ''))}",
+                    f"Entry: "
+                    f"{trade.get('entry_low')} – "
+                    f"{trade.get('entry_high')}",
+                    f"Last: "
+                    f"{trade.get('last_price', 'N/A')}",
+                    f"Status: "
+                    f"{trade.get('status', 'OPEN')}",
+                    "",
+                ]
+            )
+
+        await update.effective_message.reply_text(
+            "\n".join(lines)
+        )
+
+    # =========================================================
+    # Status
+    # =========================================================
+
+    async def status(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        try:
+            is_open, stamp = (
+                await self.service.market_is_open()
+            )
+        except Exception:
+            is_open = False
+            stamp = "N/A"
+
+        await update.effective_message.reply_text(
+            "🤖 RUNNING ✅\n\n"
+
+            f"Paper Mode: {settings.paper_mode}\n"
+            f"Live Trading: {settings.live_trading}\n"
+            f"Paused: {self._paused()}\n\n"
+
+            f"US Market Open: {is_open}\n"
+
+            f"Stocks Universe: "
+            f"{len(settings.stocks)}\n"
+
+            f"Index: "
+            f"{','.join(settings.indices)}\n\n"
+
+            f"Manual Publish: "
+            f"{settings.require_manual_publish}\n"
+
+            f"Max Per Scan: "
+            f"{settings.max_signals_per_scan}\n"
+
+            f"Max Open Trades: "
+            f"{settings.max_open_trades}\n\n"
+
+            "0DTE: OFF\n"
+
+            f"Channel ID: "
+            f"{'SET' if settings.telegram_channel_chat_id else 'PENDING'}"
+        )
+
+    # =========================================================
+    # Risk
+    # =========================================================
+
+    async def risk(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        rows = self._open_rows()
+
+        total = sum(
+            float(
+                trade.get(
+                    "risk_pct",
+                    0,
+                )
+                or 0
+            )
+            for trade in rows
+        )
+
+        await update.effective_message.reply_text(
+            "🛡️ حالة المخاطر\n\n"
+
+            f"Open Trades:\n"
+            f"{len(rows)} / "
+            f"{settings.max_open_trades}\n\n"
+
+            f"Max Risk / Trade:\n"
+            f"{settings.max_risk_per_trade * 100:.2f}%\n\n"
+
+            f"Max Total Open Risk:\n"
+            f"{settings.max_total_open_risk * 100:.2f}%\n\n"
+
+            f"Current Open Risk:\n"
+            f"{total * 100:.2f}%\n\n"
+
+            f"MIN R/R:\n"
+            f"1 : {settings.min_rr}\n\n"
+
+            "📌 يسمح النظام بسهم وعقد Option "
+            "على نفس الأصل إذا لم يكونا "
+            "Trade مكررًا وكان Risk Engine يسمح."
+        )
+
+    # =========================================================
+    # Performance
+    # =========================================================
+
+    async def performance(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        result = performance(
+            self.history_repo.all()
+        )
+
+        await update.effective_message.reply_text(
+            "📊 الأداء الورقي\n\n"
+
+            f"الصفقات: "
+            f"{result['trades']}\n"
+
+            f"الفوز: "
+            f"{result['wins']}\n"
+
+            f"الخسارة: "
+            f"{result['losses']}\n"
+
+            f"Win Rate: "
+            f"{result['win_rate']}%\n"
+
+            f"Profit Factor: "
+            f"{result['profit_factor']}\n"
+
+            f"Net P&L: "
+            f"{result['net_pnl_pct']}%"
+        )
+
+    async def report_cmd(
+        self,
+        update: Update,
+        context,
+    ):
+        # سنحوّل هذا في ملف التقرير القادم
+        # إلى صورة Weekly Report.
+        return await self.performance(
+            update,
+            context,
+        )
+
+    # =========================================================
+    # Settings
+    # =========================================================
+
+    async def settings_cmd(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        await update.effective_message.reply_text(
+            "⚙️ الإعدادات\n\n"
+
+            f"Stock Feed: "
+            f"{settings.alpaca_stock_feed}\n"
+
+            f"Options Feed: "
+            f"{settings.alpaca_options_feed}\n\n"
+
+            f"Min Score: "
+            f"{settings.min_score}\n"
+
+            f"Min R/R: "
+            f"{settings.min_rr}\n\n"
+
+            f"Default Scan Count: "
+            f"{settings.default_signals_per_scan}\n"
+
+            f"Max Scan Count: "
+            f"{settings.max_signals_per_scan}\n\n"
+
+            f"Candidate TTL: "
+            f"{settings.candidate_ttl_seconds // 60} "
+            "minutes\n\n"
+
+            f"Watermark: "
+            f"{settings.watermark_name}\n"
+
+            f"Option Card: "
+            f"{settings.option_card_orientation}\n\n"
+
+            "0DTE: OFF"
+        )
+
+    # =========================================================
+    # Pause / Resume
+    # =========================================================
+
+    async def pause(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        self._set_paused(True)
+
+        await update.effective_message.reply_text(
+            "⏸️ تم إيقاف إنشاء الإشارات اليدوية.\n"
+            "متابعة الصفقات المفتوحة تبقى فعالة."
+        )
+
+    async def resume(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        self._set_paused(False)
+
+        await update.effective_message.reply_text(
+            "▶️ تم استئناف البحث اليدوي "
+            "عن الإشارات."
+        )
+
+    # =========================================================
+    # Market
+    # =========================================================
+
+    async def market(
+        self,
+        update: Update,
+        context,
+    ):
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        from app.market.regime import (
+            MarketRegimeEngine,
+        )
+
+        regime = await MarketRegimeEngine(
+            self.service.provider
+        ).get()
+
+        is_open, stamp = (
+            await self.service.market_is_open()
+        )
+
+        await update.effective_message.reply_text(
+            "🌎 حالة السوق الأمريكي\n\n"
+
+            f"Market Regime:\n"
+            f"{regime}\n\n"
+
+            f"US Market Open:\n"
+            f"{is_open}\n\n"
+
+            "المرجع الأساسي:\n"
+            "SPY / IEX"
+        )
