@@ -8,28 +8,28 @@ from zoneinfo import ZoneInfo
 
 from app.config import settings
 from app.reports.performance import (
-    performance,
+    daily_report_data,
     weekly_report_data,
 )
-from app.reports.weekly_card import weekly_performance_card
+from app.reports.weekly_card import (
+    weekly_performance_card,
+)
 
 
 class TradeMonitor:
     """
     Monitoring-only scheduler.
 
-    مسؤول فقط عن:
-    - متابعة الصفقات المفتوحة.
+    Responsibilities:
+    - Monitor OPEN Paper Trades.
     - TP1 / TP2 / TP3.
     - Stop Loss.
     - Near Stop.
-    - Time Exit.
-    - التقرير اليومي.
-    - التقرير الأسبوعي المصور.
+    - Intraday Time Exit.
+    - Daily report.
+    - Weekly image report.
 
-    مهم:
-    لا يوجد داخل هذا Scheduler أي مسار
-    لإنشاء Signal أو Paper Trade جديد.
+    It NEVER creates new signals.
     """
 
     def __init__(
@@ -103,45 +103,55 @@ class TradeMonitor:
             pass
 
     # =========================================================
-    # Reports
+    # Daily Report
     # =========================================================
 
-    async def _send_daily_report(self):
+    async def _send_daily_report(
+        self,
+    ):
         """
-        التقرير اليومي يبقى نصيًا حاليًا.
+        Today's CLOSED trades only.
 
-        التقرير الأسبوعي فقط هو المصور
-        حسب التصميم الذي اعتمدناه.
+        This is NOT lifetime performance.
         """
 
-        result = performance(
+        report = daily_report_data(
             self.history_repo.all()
+        )
+
+        result = report.get(
+            "summary",
+            {},
         )
 
         text = (
             "📊 التقرير اليومي — Paper Trading\n\n"
 
-            f"الصفقات المغلقة: "
-            f"{result['trades']}\n"
+            f"الصفقات المغلقة اليوم: "
+            f"{result.get('trades', 0)}\n"
 
             f"الرابحة: "
-            f"{result['wins']}\n"
+            f"{result.get('wins', 0)}\n"
 
             f"الخاسرة: "
-            f"{result['losses']}\n"
+            f"{result.get('losses', 0)}\n"
+
+            f"Breakeven: "
+            f"{result.get('breakeven', 0)}\n"
 
             f"Win Rate: "
-            f"{result['win_rate']}%\n"
+            f"{result.get('win_rate', 0)}%\n"
 
             f"Profit Factor: "
-            f"{result['profit_factor']}\n"
+            f"{result.get('profit_factor', 0)}\n"
 
-            f"Net P&L: "
-            f"{result['net_pnl_pct']}%\n"
+            f"Net P&L اليوم: "
+            f"{result.get('net_pnl_pct', 0)}%\n"
 
             f"Max Drawdown: "
-            f"{result['max_drawdown_pct']}%\n\n"
+            f"{result.get('max_drawdown_pct', 0)}%\n\n"
 
+            "⚠️ النتائج المحققة اليوم فقط\n"
             "⚠️ Paper Trading فقط"
         )
 
@@ -150,16 +160,13 @@ class TradeMonitor:
             text,
         )
 
-    async def _send_weekly_report(self):
-        """
-        ينشئ صورة Weekly Performance Report
-        ويرسلها بواسطة Report Bot.
+    # =========================================================
+    # Weekly Image Report
+    # =========================================================
 
-        الصورة تفصل بين:
-        - Closed / Realized
-        - Open / Unrealized
-        """
-
+    async def _send_weekly_report(
+        self,
+    ):
         report = weekly_report_data(
             history=self.history_repo.all(),
             open_trades=self.open_repo.all(),
@@ -217,8 +224,11 @@ class TradeMonitor:
                 f"Win Rate: "
                 f"{summary.get('win_rate', 0)}%\n"
 
+                f"Profit Factor: "
+                f"{summary.get('profit_factor', 0)}\n"
+
                 f"Net Realized P&L: "
-                f"{net_pnl:+.2f}%\n"
+                f"{net_pnl:+.2f}%\n\n"
 
                 f"Open Positions: "
                 f"{open_summary.get('total', 0)}\n"
@@ -249,7 +259,13 @@ class TradeMonitor:
             except OSError:
                 pass
 
-    async def _scheduled_reports(self):
+    # =========================================================
+    # Scheduled Reports
+    # =========================================================
+
+    async def _scheduled_reports(
+        self,
+    ):
         if not self.channel_id:
             return
 
@@ -259,9 +275,9 @@ class TradeMonitor:
             )
         )
 
-        # -------------------------------------------------
-        # Daily report
-        # -------------------------------------------------
+        # =====================================================
+        # Daily Report
+        # =====================================================
 
         if (
             settings.daily_report_enabled
@@ -276,14 +292,11 @@ class TradeMonitor:
 
             await self._send_daily_report()
 
-        # -------------------------------------------------
-        # Weekly report
+        # =====================================================
+        # Weekly Report
         #
         # Friday evening Riyadh.
-        # weekday:
-        # Monday = 0
-        # Friday = 4
-        # -------------------------------------------------
+        # =====================================================
 
         if (
             settings.weekly_report_enabled
@@ -310,25 +323,31 @@ class TradeMonitor:
                 await self._send_weekly_report()
 
     # =========================================================
-    # Trade Monitoring
+    # Monitoring Cycle
     # =========================================================
 
-    async def cycle(self):
+    async def cycle(
+        self,
+    ):
         rows = self.open_repo.all()
 
         changed = False
 
         # =====================================================
-        # Stock latest bars
+        # Stocks
         # =====================================================
 
         stocks = [
             trade["symbol"]
             for trade in rows
             if (
-                trade.get("status")
+                trade.get(
+                    "status"
+                )
                 == "OPEN"
-                and trade.get("option")
+                and trade.get(
+                    "option"
+                )
                 is None
             )
         ]
@@ -346,15 +365,12 @@ class TradeMonitor:
                         )
                     )
                 )
+
         except Exception:
             stockbars = {}
 
         # =====================================================
-        # Option quotes
-        #
-        # Includes:
-        # - Equity Options
-        # - SPX Options
+        # Options
         # =====================================================
 
         option_contracts = [
@@ -369,7 +385,9 @@ class TradeMonitor:
             )
             for trade in rows
             if (
-                trade.get("status")
+                trade.get(
+                    "status"
+                )
                 == "OPEN"
                 and trade.get(
                     "option"
@@ -397,6 +415,7 @@ class TradeMonitor:
                         )
                     )
                 )
+
         except Exception:
             optquotes = {}
 
@@ -418,33 +437,38 @@ class TradeMonitor:
             )
 
         except Exception:
-            # Do not force-close trades if market clock
-            # cannot be retrieved.
+            # Do not close trades just because
+            # the clock API temporarily failed.
             market_open = True
 
         # =====================================================
-        # Process Open Trades
+        # Iterate Trades
         # =====================================================
 
         still_open = []
 
         for trade in rows:
             if (
-                trade.get("status")
+                trade.get(
+                    "status"
+                )
                 != "OPEN"
             ):
                 still_open.append(
                     trade
                 )
+
                 continue
 
             price = None
 
-            # -------------------------------------------------
-            # Option
-            # -------------------------------------------------
+            # =================================================
+            # Option Quote
+            # =================================================
 
-            if trade.get("option"):
+            if trade.get(
+                "option"
+            ):
                 option = (
                     trade.get(
                         "option",
@@ -453,10 +477,8 @@ class TradeMonitor:
                     or {}
                 )
 
-                contract_symbol = (
-                    option.get(
-                        "symbol"
-                    )
+                contract_symbol = option.get(
+                    "symbol"
                 )
 
                 quote = (
@@ -519,9 +541,9 @@ class TradeMonitor:
                 ):
                     price = None
 
-            # -------------------------------------------------
-            # Stock
-            # -------------------------------------------------
+            # =================================================
+            # Stock Quote
+            # =================================================
 
             else:
                 bar = (
@@ -533,27 +555,31 @@ class TradeMonitor:
                 )
 
                 if (
-                    bar.get("c")
+                    bar.get(
+                        "c"
+                    )
                     is not None
                 ):
                     try:
                         price = float(
                             bar["c"]
                         )
+
                     except (
                         TypeError,
                         ValueError,
                     ):
                         price = None
 
-            # -------------------------------------------------
-            # No usable price
-            # -------------------------------------------------
+            # =================================================
+            # No Current Price
+            # =================================================
 
             if price is None:
                 still_open.append(
                     trade
                 )
+
                 continue
 
             price = round(
@@ -574,7 +600,7 @@ class TradeMonitor:
             changed = True
 
             # =================================================
-            # Direction
+            # Direction + Entry
             # =================================================
 
             long_trade = (
@@ -585,11 +611,15 @@ class TradeMonitor:
             )
 
             entry_low = float(
-                trade["entry_low"]
+                trade[
+                    "entry_low"
+                ]
             )
 
             entry_high = float(
-                trade["entry_high"]
+                trade[
+                    "entry_high"
+                ]
             )
 
             entry = (
@@ -598,15 +628,19 @@ class TradeMonitor:
             ) / 2
 
             stop = float(
-                trade["stop"]
+                trade[
+                    "stop"
+                ]
             )
 
             initial_risk = (
                 abs(
-                    entry - stop
+                    entry
+                    - stop
                 )
                 or max(
-                    entry * 0.01,
+                    entry
+                    * 0.01,
                     0.01,
                 )
             )
@@ -646,7 +680,8 @@ class TradeMonitor:
                 ] = round(
                     (
                         (
-                            price - entry
+                            price
+                            - entry
                         )
                         / entry
                         * 100
@@ -691,9 +726,11 @@ class TradeMonitor:
             # =================================================
 
             distance_to_stop = (
-                price - stop
+                price
+                - stop
                 if long_trade
-                else stop - price
+                else stop
+                - price
             )
 
             if (
@@ -763,7 +800,8 @@ class TradeMonitor:
                 ] = round(
                     (
                         (
-                            price - entry
+                            price
+                            - entry
                         )
                         / entry
                         * 100
@@ -861,10 +899,7 @@ class TradeMonitor:
                         ),
                     )
 
-                    # -----------------------------------------
                     # TP1 -> Break Even
-                    # -----------------------------------------
-
                     if (
                         target_number == 1
                         and settings
@@ -878,7 +913,7 @@ class TradeMonitor:
                         )
 
             # =================================================
-            # TP3 = Trade Completed
+            # TP3 Complete
             # =================================================
 
             if trade.get(
@@ -907,7 +942,8 @@ class TradeMonitor:
                 ] = round(
                     (
                         (
-                            price - entry
+                            price
+                            - entry
                         )
                         / entry
                         * 100
@@ -931,7 +967,7 @@ class TradeMonitor:
             )
 
         # =====================================================
-        # Save Open Trades
+        # Save State
         # =====================================================
 
         if changed:
@@ -940,7 +976,7 @@ class TradeMonitor:
             )
 
         # =====================================================
-        # Scheduled Reports
+        # Reports
         # =====================================================
 
         await self._scheduled_reports()
@@ -949,14 +985,14 @@ class TradeMonitor:
     # Loop
     # =========================================================
 
-    async def loop(self):
+    async def loop(
+        self,
+    ):
         while True:
             try:
                 await self.cycle()
 
             except Exception:
-                # Scheduler must stay alive even if
-                # one cycle encounters a temporary API failure.
                 pass
 
             await asyncio.sleep(
@@ -967,13 +1003,17 @@ class TradeMonitor:
     # Start / Stop
     # =========================================================
 
-    def start(self):
+    def start(
+        self,
+    ):
         if not self._task:
             self._task = asyncio.create_task(
                 self.loop()
             )
 
-    async def stop(self):
+    async def stop(
+        self,
+    ):
         if self._task:
             self._task.cancel()
 
