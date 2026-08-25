@@ -8,14 +8,19 @@ from typing import Any
 # Helpers
 # =========================================================
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
 
 
-def _parse_datetime(value: Any) -> datetime | None:
+def _parse_datetime(
+    value: Any,
+) -> datetime | None:
     """
     Accepts ISO datetime strings such as:
     2026-08-25T18:30:00+00:00
@@ -27,6 +32,7 @@ def _parse_datetime(value: Any) -> datetime | None:
 
     if isinstance(value, datetime):
         dt = value
+
     else:
         try:
             dt = datetime.fromisoformat(
@@ -35,6 +41,7 @@ def _parse_datetime(value: Any) -> datetime | None:
                     "+00:00",
                 )
             )
+
         except (TypeError, ValueError):
             return None
 
@@ -48,7 +55,9 @@ def _parse_datetime(value: Any) -> datetime | None:
     )
 
 
-def _is_closed(trade: dict) -> bool:
+def _is_closed(
+    trade: dict,
+) -> bool:
     status = str(
         trade.get(
             "status",
@@ -68,12 +77,10 @@ def _normalized_result(
     trade: dict,
 ) -> str:
     """
-    We do NOT trust status alone.
+    Manual closes usually use status=CLOSED.
 
-    Manual closes usually use:
-    status=CLOSED
-
-    Therefore result is derived primarily from pnl_pct.
+    Result is derived from pnl_pct so a profitable
+    manual close is correctly counted as WIN.
     """
 
     pnl = _safe_float(
@@ -129,7 +136,6 @@ def _contract_name(
 ) -> str:
     """
     Examples:
-
     NVDA
     NVDA 185 CALL
     SPX 6500 CALL
@@ -142,9 +148,10 @@ def _contract_name(
         )
     ).upper()
 
-    option = trade.get(
-        "option"
-    ) or {}
+    option = (
+        trade.get("option")
+        or {}
+    )
 
     if not option:
         return symbol
@@ -184,15 +191,17 @@ def _contract_name(
             option_type
         )
 
-    return " ".join(parts)
+    return " ".join(
+        parts
+    )
 
 
 def _entry_price(
     trade: dict,
 ) -> float:
     """
-    Paper execution currently treats entry_high
-    as the conservative buy/reference fill.
+    Uses filled entry when available.
+    Otherwise falls back to entry_high.
     """
 
     value = trade.get(
@@ -209,15 +218,17 @@ def _entry_price(
         ),
     )
 
-    return _safe_float(value)
+    return _safe_float(
+        value
+    )
 
 
 def _exit_or_last_price(
     trade: dict,
 ) -> tuple[float, str]:
     """
-    Closed -> Exit Price
-    Open   -> Last Price
+    Closed -> EXIT
+    Open   -> LAST
     """
 
     if _is_closed(trade):
@@ -252,16 +263,8 @@ def _calculate_open_pnl(
     trade: dict,
 ) -> float:
     """
-    For open positions, calculate unrealized P&L
-    from Entry vs Last when possible.
+    Calculates unrealized P&L for open positions.
     """
-
-    stored = trade.get(
-        "pnl_pct"
-    )
-
-    if stored is not None:
-        return _safe_float(stored)
 
     entry = _entry_price(
         trade
@@ -271,8 +274,16 @@ def _calculate_open_pnl(
         trade
     )
 
-    if entry <= 0 or last <= 0:
-        return 0.0
+    if (
+        entry <= 0
+        or last <= 0
+    ):
+        return _safe_float(
+            trade.get(
+                "pnl_pct",
+                0,
+            )
+        )
 
     return (
         (
@@ -290,17 +301,9 @@ def _max_drawdown(
     closed: list[dict],
 ) -> float:
     """
-    Simple cumulative percentage equity curve
-    for Paper Trading reporting.
+    Trade-return based paper trading drawdown.
 
-    Example:
-    +2
-    -1
-    +3
-    -4
-
-    This is NOT capital-weighted portfolio drawdown.
-    It is a trade-return based reporting metric.
+    This is not capital-weighted portfolio drawdown.
     """
 
     if not closed:
@@ -338,7 +341,8 @@ def _max_drawdown(
         )
 
         drawdown = (
-            cumulative - peak
+            cumulative
+            - peak
         )
 
         max_drawdown = min(
@@ -353,17 +357,16 @@ def _max_drawdown(
 
 
 # =========================================================
-# Standard Performance
+# Standard / Lifetime Performance
 # =========================================================
 
 def performance(
     history: list[dict],
 ) -> dict:
     """
-    Backward compatible summary.
+    Historical performance summary.
 
-    Existing Telegram commands can continue using:
-    performance(history)
+    Used by /performance.
     """
 
     closed = [
@@ -491,6 +494,98 @@ def performance(
 
 
 # =========================================================
+# Daily Report
+# =========================================================
+
+def daily_report_data(
+    history: list[dict],
+    now: datetime | None = None,
+) -> dict:
+    """
+    Daily realized performance only.
+
+    Counts only trades closed during the current UTC day.
+    Open positions are excluded.
+    """
+
+    now = (
+        now
+        or datetime.now(
+            timezone.utc
+        )
+    )
+
+    if now.tzinfo is None:
+        now = now.replace(
+            tzinfo=timezone.utc
+        )
+
+    now = now.astimezone(
+        timezone.utc
+    )
+
+    day_start = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    daily_closed: list[dict] = []
+
+    for trade in history:
+        if not _is_closed(
+            trade
+        ):
+            continue
+
+        closed_at = _parse_datetime(
+            trade.get(
+                "closed_at"
+            )
+        )
+
+        # Compatibility with older history entries.
+        if closed_at is None:
+            closed_at = _parse_datetime(
+                trade.get(
+                    "updated_at"
+                )
+            )
+
+        if closed_at is None:
+            continue
+
+        if (
+            day_start
+            <= closed_at
+            <= now
+        ):
+            daily_closed.append(
+                trade
+            )
+
+    return {
+        "generated_at":
+            now.isoformat(),
+
+        "day_start":
+            day_start.isoformat(),
+
+        "day_end":
+            now.isoformat(),
+
+        "summary":
+            performance(
+                daily_closed
+            ),
+
+        "closed_trades":
+            daily_closed,
+    }
+
+
+# =========================================================
 # Weekly Report
 # =========================================================
 
@@ -500,15 +595,16 @@ def weekly_report_data(
     now: datetime | None = None,
 ) -> dict:
     """
-    Prepares ALL data required by weekly_card.py.
+    Prepares all data required by weekly_card.py.
 
-    Closed trades and open positions are deliberately
-    separated so unrealized profit is never reported
-    as realized weekly performance.
+    Realized and unrealized performance are kept separate.
     """
 
-    now = now or datetime.now(
-        timezone.utc
+    now = (
+        now
+        or datetime.now(
+            timezone.utc
+        )
     )
 
     if now.tzinfo is None:
@@ -533,12 +629,12 @@ def weekly_report_data(
         microsecond=0,
     )
 
-    week_end = now
-
     weekly_closed: list[dict] = []
 
     for trade in history:
-        if not _is_closed(trade):
+        if not _is_closed(
+            trade
+        ):
             continue
 
         closed_at = _parse_datetime(
@@ -547,7 +643,7 @@ def weekly_report_data(
             )
         )
 
-        # Compatibility with older stored trades
+        # Compatibility with older stored trades.
         if closed_at is None:
             closed_at = _parse_datetime(
                 trade.get(
@@ -561,7 +657,7 @@ def weekly_report_data(
         if (
             week_start
             <= closed_at
-            <= week_end
+            <= now
         ):
             weekly_closed.append(
                 trade
@@ -570,6 +666,10 @@ def weekly_report_data(
     summary = performance(
         weekly_closed
     )
+
+    # =====================================================
+    # Closed Trades
+    # =====================================================
 
     closed_rows = []
 
@@ -647,16 +747,28 @@ def weekly_report_data(
                         "exit_reason",
                         "N/A",
                     ),
+
+                "closed_at":
+                    trade.get(
+                        "closed_at",
+                        "",
+                    ),
             }
         )
 
-    # Most recent closed trades first.
     closed_rows.sort(
-        key=lambda row: row[
-            "trade_id"
-        ],
+        key=lambda row: (
+            row.get(
+                "closed_at",
+                ""
+            )
+        ),
         reverse=True,
     )
+
+    # =====================================================
+    # Open Positions
+    # =====================================================
 
     open_rows = []
 
@@ -680,13 +792,19 @@ def weekly_report_data(
         )
 
         if pnl > 0:
-            result = "OPEN_PROFIT"
+            result = (
+                "OPEN_PROFIT"
+            )
 
         elif pnl < 0:
-            result = "OPEN_LOSS"
+            result = (
+                "OPEN_LOSS"
+            )
 
         else:
-            result = "OPEN_FLAT"
+            result = (
+                "OPEN_FLAT"
+            )
 
         open_rows.append(
             {
@@ -746,10 +864,11 @@ def weekly_report_data(
             }
         )
 
-    # Biggest open gain/loss first by absolute move.
     open_rows.sort(
         key=lambda row: abs(
-            row["pnl_pct"]
+            row[
+                "pnl_pct"
+            ]
         ),
         reverse=True,
     )
@@ -757,13 +876,17 @@ def weekly_report_data(
     open_profit = [
         row
         for row in open_rows
-        if row["pnl_pct"] > 0
+        if row[
+            "pnl_pct"
+        ] > 0
     ]
 
     open_loss = [
         row
         for row in open_rows
-        if row["pnl_pct"] < 0
+        if row[
+            "pnl_pct"
+        ] < 0
     ]
 
     return {
@@ -774,35 +897,41 @@ def weekly_report_data(
             week_start.isoformat(),
 
         "week_end":
-            week_end.isoformat(),
+            now.isoformat(),
 
-        # Realized statistics only.
         "summary":
             summary,
 
-        # Closed trades this week.
         "closed_trades":
             closed_rows,
 
-        # Current unrealized positions.
         "open_trades":
             open_rows,
 
         "open_summary": {
             "total":
-                len(open_rows),
+                len(
+                    open_rows
+                ),
 
             "profitable":
-                len(open_profit),
+                len(
+                    open_profit
+                ),
 
             "losing":
-                len(open_loss),
+                len(
+                    open_loss
+                ),
 
             "unrealized_pnl_pct":
                 round(
                     sum(
-                        row["pnl_pct"]
-                        for row in open_rows
+                        row[
+                            "pnl_pct"
+                        ]
+                        for row
+                        in open_rows
                     ),
                     2,
                 ),
