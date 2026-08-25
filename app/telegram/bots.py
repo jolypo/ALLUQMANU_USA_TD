@@ -11,7 +11,13 @@ from telegram.ext import Application, CommandHandler
 
 from app.config import settings
 from app.reports.card import option_card
-from app.reports.performance import performance
+from app.reports.performance import (
+    performance,
+    weekly_report_data,
+)
+from app.reports.weekly_card import (
+    weekly_performance_card,
+)
 from app.telegram.messages import signal_text
 
 
@@ -2484,12 +2490,109 @@ class TelegramHub:
         update: Update,
         context,
     ):
-        # سنحوّل هذا في ملف التقرير القادم
-        # إلى صورة Weekly Report.
-        return await self.performance(
-            update,
-            context,
+        """
+        Manual weekly image report.
+
+        - Admin only.
+        - Private chat only.
+        - Sends the report privately to the admin.
+        - Does not publish anything to the channel.
+        """
+
+        if not self.allowed(update):
+            return await self._deny(update)
+
+        if not await self._require_private(update):
+            return
+
+        await update.effective_message.reply_text(
+            "📊 جاري تجهيز التقرير الأسبوعي المصور..."
         )
+
+        report = weekly_report_data(
+            history=self.history_repo.all(),
+            open_trades=self.open_repo.all(),
+        )
+
+        summary = report.get(
+            "summary",
+            {},
+        )
+
+        open_summary = report.get(
+            "open_summary",
+            {},
+        )
+
+        image_path = os.path.join(
+            tempfile.gettempdir(),
+            "ALLUQMANU_USA_TD_MANUAL_WEEKLY_REPORT.png",
+        )
+
+        try:
+            weekly_performance_card(
+                report,
+                image_path,
+            )
+
+            net_pnl = float(
+                summary.get(
+                    "net_pnl_pct",
+                    0,
+                )
+                or 0
+            )
+
+            unrealized = float(
+                open_summary.get(
+                    "unrealized_pnl_pct",
+                    0,
+                )
+                or 0
+            )
+
+            caption = (
+                "📈 التقرير الأسبوعي — Paper Trading\n\n"
+                f"الصفقات المغلقة: {summary.get('trades', 0)}\n"
+                f"الرابحة: {summary.get('wins', 0)}\n"
+                f"الخاسرة: {summary.get('losses', 0)}\n"
+                f"Breakeven: {summary.get('breakeven', 0)}\n\n"
+                f"Win Rate: {summary.get('win_rate', 0)}%\n"
+                f"Profit Factor: {summary.get('profit_factor', 0)}\n"
+                f"Net Realized P&L: {net_pnl:+.2f}%\n"
+                f"Max Drawdown: {summary.get('max_drawdown_pct', 0)}%\n\n"
+                f"Open Positions: {open_summary.get('total', 0)}\n"
+                f"Open Profit: {open_summary.get('profitable', 0)}\n"
+                f"Open Loss: {open_summary.get('losing', 0)}\n"
+                f"Unrealized P&L: {unrealized:+.2f}%\n\n"
+                "🟢 الأخضر = ربح\n"
+                "🔴 الأحمر = خسارة\n\n"
+                "⚠️ Closed = Realized\n"
+                "⚠️ Open = Unrealized\n"
+                "⚠️ Paper Trading فقط"
+            )
+
+            with open(
+                image_path,
+                "rb",
+            ) as image_file:
+                await update.effective_message.reply_photo(
+                    photo=image_file,
+                    caption=caption,
+                )
+
+        except Exception as exc:
+            await update.effective_message.reply_text(
+                "❌ تعذر إنشاء التقرير المصور.\n\n"
+                f"Error: {type(exc).__name__}"
+            )
+
+        finally:
+            try:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+            except OSError:
+                pass
 
     # =========================================================
     # Settings
