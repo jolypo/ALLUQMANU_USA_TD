@@ -21,18 +21,11 @@ def _safe_float(
 def _parse_datetime(
     value: Any,
 ) -> datetime | None:
-    """
-    Accepts ISO datetime strings such as:
-    2026-08-25T18:30:00+00:00
-    2026-08-25T18:30:00Z
-    """
-
     if not value:
         return None
 
     if isinstance(value, datetime):
         dt = value
-
     else:
         try:
             dt = datetime.fromisoformat(
@@ -41,7 +34,6 @@ def _parse_datetime(
                     "+00:00",
                 )
             )
-
         except (TypeError, ValueError):
             return None
 
@@ -76,13 +68,6 @@ def _is_closed(
 def _normalized_result(
     trade: dict,
 ) -> str:
-    """
-    Manual closes usually use status=CLOSED.
-
-    Result is derived from pnl_pct so a profitable
-    manual close is correctly counted as WIN.
-    """
-
     pnl = _safe_float(
         trade.get(
             "pnl_pct",
@@ -134,13 +119,6 @@ def _trade_type_label(
 def _contract_name(
     trade: dict,
 ) -> str:
-    """
-    Examples:
-    NVDA
-    NVDA 185 CALL
-    SPX 6500 CALL
-    """
-
     symbol = str(
         trade.get(
             "symbol",
@@ -199,11 +177,6 @@ def _contract_name(
 def _entry_price(
     trade: dict,
 ) -> float:
-    """
-    Uses filled entry when available.
-    Otherwise falls back to entry_high.
-    """
-
     value = trade.get(
         "filled_entry_price",
         trade.get(
@@ -226,11 +199,6 @@ def _entry_price(
 def _exit_or_last_price(
     trade: dict,
 ) -> tuple[float, str]:
-    """
-    Closed -> EXIT
-    Open   -> LAST
-    """
-
     if _is_closed(trade):
         value = trade.get(
             "exit_price",
@@ -259,11 +227,56 @@ def _exit_or_last_price(
     )
 
 
+def _calculate_pnl_pct(
+    entry: float,
+    exit_price: float,
+    direction: str,
+) -> float:
+    """
+    Direction-aware P&L.
+
+    LONG:
+        price rises = profit
+
+    SHORT:
+        price falls = profit
+    """
+
+    if (
+        entry <= 0
+        or exit_price <= 0
+    ):
+        return 0.0
+
+    direction = str(
+        direction or "LONG"
+    ).upper()
+
+    if direction == "SHORT":
+        return (
+            (
+                entry - exit_price
+            )
+            / entry
+        ) * 100
+
+    return (
+        (
+            exit_price - entry
+        )
+        / entry
+    ) * 100
+
+
 def _calculate_open_pnl(
     trade: dict,
 ) -> float:
     """
-    Calculates unrealized P&L for open positions.
+    Unrealized P&L for OPEN trades.
+
+    Supports both:
+    - LONG
+    - SHORT
     """
 
     entry = _entry_price(
@@ -285,12 +298,14 @@ def _calculate_open_pnl(
             )
         )
 
-    return (
-        (
-            last - entry
-        )
-        / entry
-    ) * 100
+    return _calculate_pnl_pct(
+        entry=entry,
+        exit_price=last,
+        direction=trade.get(
+            "direction",
+            "LONG",
+        ),
+    )
 
 
 # =========================================================
@@ -300,12 +315,6 @@ def _calculate_open_pnl(
 def _max_drawdown(
     closed: list[dict],
 ) -> float:
-    """
-    Trade-return based paper trading drawdown.
-
-    This is not capital-weighted portfolio drawdown.
-    """
-
     if not closed:
         return 0.0
 
@@ -357,18 +366,12 @@ def _max_drawdown(
 
 
 # =========================================================
-# Standard / Lifetime Performance
+# Historical Performance
 # =========================================================
 
 def performance(
     history: list[dict],
 ) -> dict:
-    """
-    Historical performance summary.
-
-    Used by /performance.
-    """
-
     closed = [
         trade
         for trade in history
@@ -501,13 +504,6 @@ def daily_report_data(
     history: list[dict],
     now: datetime | None = None,
 ) -> dict:
-    """
-    Daily realized performance only.
-
-    Counts only trades closed during the current UTC day.
-    Open positions are excluded.
-    """
-
     now = (
         now
         or datetime.now(
@@ -545,7 +541,6 @@ def daily_report_data(
             )
         )
 
-        # Compatibility with older history entries.
         if closed_at is None:
             closed_at = _parse_datetime(
                 trade.get(
@@ -594,12 +589,6 @@ def weekly_report_data(
     open_trades: list[dict],
     now: datetime | None = None,
 ) -> dict:
-    """
-    Prepares all data required by weekly_card.py.
-
-    Realized and unrealized performance are kept separate.
-    """
-
     now = (
         now
         or datetime.now(
@@ -616,7 +605,6 @@ def weekly_report_data(
         timezone.utc
     )
 
-    # Monday 00:00 UTC
     week_start = (
         now
         - timedelta(
@@ -643,7 +631,6 @@ def weekly_report_data(
             )
         )
 
-        # Compatibility with older stored trades.
         if closed_at is None:
             closed_at = _parse_datetime(
                 trade.get(
@@ -714,6 +701,14 @@ def weekly_report_data(
                         )
                     ),
 
+                "direction":
+                    str(
+                        trade.get(
+                            "direction",
+                            "LONG",
+                        )
+                    ).upper(),
+
                 "entry_price":
                     round(
                         _entry_price(
@@ -767,7 +762,7 @@ def weekly_report_data(
     )
 
     # =====================================================
-    # Open Positions
+    # Open Trades
     # =====================================================
 
     open_rows = []
@@ -792,19 +787,13 @@ def weekly_report_data(
         )
 
         if pnl > 0:
-            result = (
-                "OPEN_PROFIT"
-            )
+            result = "OPEN_PROFIT"
 
         elif pnl < 0:
-            result = (
-                "OPEN_LOSS"
-            )
+            result = "OPEN_LOSS"
 
         else:
-            result = (
-                "OPEN_FLAT"
-            )
+            result = "OPEN_FLAT"
 
         open_rows.append(
             {
@@ -832,6 +821,14 @@ def weekly_report_data(
                             "",
                         )
                     ),
+
+                "direction":
+                    str(
+                        trade.get(
+                            "direction",
+                            "LONG",
+                        )
+                    ).upper(),
 
                 "entry_price":
                     round(
