@@ -62,21 +62,41 @@ monitor = TradeMonitor(
 async def lifespan(app: FastAPI):
     """
     Startup:
-    - Initialize Signal Bot application.
-    - Start Telegram processing.
+    - Initialize Signal Bot.
+    - Initialize Profit Bot.
+    - Initialize Report Bot.
+    - Start Signal Bot application.
     - Start monitoring-only scheduler.
-    - Configure Telegram webhook.
+    - Configure Signal Bot webhook.
 
     Shutdown:
     - Stop scheduler.
-    - Stop Telegram application.
-    - Close Alpaca HTTP session.
+    - Stop Signal Bot application.
+    - Shutdown Profit Bot.
+    - Shutdown Report Bot.
+    - Close Alpaca provider.
     """
 
+    # =====================================================
+    # Telegram Initialization
+    # =====================================================
+
     await hub.app.initialize()
+
+    await hub.profit.initialize()
+    await hub.report.initialize()
+
     await hub.app.start()
 
+    # =====================================================
+    # Monitoring Scheduler
+    # =====================================================
+
     monitor.start()
+
+    # =====================================================
+    # Signal Bot Webhook
+    # =====================================================
 
     if settings.public_base_url:
         webhook_url = (
@@ -103,10 +123,17 @@ async def lifespan(app: FastAPI):
         yield
 
     finally:
+        # =================================================
+        # Shutdown
+        # =================================================
+
         await monitor.stop()
 
         await hub.app.stop()
         await hub.app.shutdown()
+
+        await hub.profit.shutdown()
+        await hub.report.shutdown()
 
         await provider.close()
 
