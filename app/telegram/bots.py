@@ -266,6 +266,74 @@ class TelegramHub:
             f'{strike} {contract_type}'
         ).strip()
 
+    @staticmethod
+    def _entry_reference(trade: dict) -> float:
+        stored = trade.get(
+            "filled_entry_price",
+            trade.get("entry_price"),
+        )
+
+        if stored is not None:
+            try:
+                return float(stored)
+            except (TypeError, ValueError):
+                pass
+
+        direction = str(
+            trade.get("direction", "LONG")
+        ).upper()
+
+        if direction == "SHORT":
+            value = trade.get(
+                "entry_low",
+                trade.get("entry_high", 0),
+            )
+        else:
+            value = trade.get(
+                "entry_high",
+                trade.get("entry_low", 0),
+            )
+
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _trade_pnl_pct(
+        cls,
+        trade: dict,
+        current_price: float,
+    ) -> float:
+        entry = cls._entry_reference(trade)
+
+        if entry <= 0:
+            return 0.0
+
+        try:
+            price = float(current_price)
+        except (TypeError, ValueError):
+            return 0.0
+
+        direction = str(
+            trade.get("direction", "LONG")
+        ).upper()
+
+        multiplier = (
+            -1.0
+            if direction == "SHORT"
+            else 1.0
+        )
+
+        return (
+            (
+                price - entry
+            )
+            / entry
+            * 100.0
+            * multiplier
+        )
+
     # =========================================================
     # Candidate Expiry
     # =========================================================
@@ -482,16 +550,19 @@ class TelegramHub:
             if trade_id and trade_id in seen_ids:
                 continue
 
-            created_at = row.get("created_at")
+            published_at = (
+                row.get("published_at")
+                or row.get("created_at")
+            )
 
-            if not created_at:
+            if not published_at:
                 continue
 
             try:
                 created_date = (
                     datetime.fromisoformat(
                         str(
-                            created_at
+                            published_at
                         ).replace(
                             "Z",
                             "+00:00",
@@ -1157,6 +1228,10 @@ class TelegramHub:
             ).isoformat()
         )
 
+        trade["filled_entry_price"] = (
+            self._entry_reference(trade)
+        )
+
         trade.update(
             {
                 "tp1_hit": False,
@@ -1431,15 +1506,8 @@ class TelegramHub:
                 time.monotonic(),
         }
 
-        entry = float(
-            trade.get(
-                "entry_high",
-                trade.get(
-                    "entry_low",
-                    0,
-                ),
-            )
-            or 0
+        entry = self._entry_reference(
+            trade
         )
 
         pnl_text = "N/A"
@@ -1448,13 +1516,10 @@ class TelegramHub:
             last_price is not None
             and entry > 0
         ):
-            pnl = (
-                (
-                    last_price
-                    - entry
-                )
-                / entry
-            ) * 100
+            pnl = self._trade_pnl_pct(
+                trade,
+                last_price,
+            )
 
             pnl_text = f"{pnl:+.2f}%"
 
@@ -1872,26 +1937,14 @@ class TelegramHub:
                 )
             )
 
-        entry = float(
-            trade.get(
-                "entry_high",
-                trade.get(
-                    "entry_low",
-                    0,
-                ),
-            )
-            or 0
+        entry = self._entry_reference(
+            trade
         )
 
-        pnl_pct = 0.0
-
-        if entry > 0:
-            pnl_pct = (
-                (
-                    exit_price - entry
-                )
-                / entry
-            ) * 100
+        pnl_pct = self._trade_pnl_pct(
+            trade,
+            exit_price,
+        )
 
         closed_trade = dict(trade)
 
@@ -2161,26 +2214,14 @@ class TelegramHub:
                     )
                     continue
 
-                entry = float(
-                    trade.get(
-                        "entry_high",
-                        trade.get(
-                            "entry_low",
-                            0,
-                        ),
-                    )
-                    or 0
+                entry = self._entry_reference(
+                    trade
                 )
 
-                pnl_pct = 0.0
-
-                if entry > 0:
-                    pnl_pct = (
-                        (
-                            exit_price - entry
-                        )
-                        / entry
-                    ) * 100
+                pnl_pct = self._trade_pnl_pct(
+                    trade,
+                    exit_price,
+                )
 
                 result = dict(trade)
 
